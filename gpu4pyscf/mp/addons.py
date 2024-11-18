@@ -725,7 +725,8 @@ def get_cderi_uov_direct_incore_gpu(
     # also note that before decomposition, dtype must be FP64
     cderi_uov = [cp.empty([naux, nocc, nvir], dtype=cp.float64) for (nocc, nvir) in zip(nocc_list, nvir_list)]
 
-    t0 = t1 = log.init_timer()
+    t0 = log.init_timer()
+    t1 = log.init_timer()
 
     # === step 0: generate intopt object ===
     # this object need to be generated before j2c, due to orbital rearrangement
@@ -740,7 +741,7 @@ def get_cderi_uov_direct_incore_gpu(
 
     # === step 0: generate 2c-2e ERI and decomposition ===
     j2c = cp.asarray(fill_2c2e(mol, auxmol))
-    j2c = cp.asarray(j2c[cp.ix_(intopt.aux_ao_idx, intopt.aux_ao_idx)], order="C")
+    j2c = intopt.sort_orbitals(j2c, aux_axis=[0, 1])
     j2c_decomp = get_j2c_decomp_gpu(mol, j2c, alg=j2c_alg, verbose=verbose)
     if "j2c_l" in j2c_decomp:
         j2c_decomp["j2c_l"] = cp.asarray(j2c_decomp["j2c_l"])
@@ -758,9 +759,9 @@ def get_cderi_uov_direct_incore_gpu(
             p0, p1 = intopt.cart_aux_loc[idx_p], intopt.cart_aux_loc[idx_p + 1]
         j3c = get_int3c2e_by_aux_id(mol, intopt, idx_p)
         for iset in range(nset):
-            occ_coeff_rearranged = occ_coeff[iset][intopt.ao_idx]
-            vir_coeff_rearranged = vir_coeff[iset][intopt.ao_idx]
-            cderi_uov[iset][p0:p1] = occ_coeff_rearranged.T @ j3c @ vir_coeff_rearranged
+            occ_coeff_sorted = intopt.sort_orbitals(occ_coeff[iset], axis=[0])
+            vir_coeff_sorted = intopt.sort_orbitals(vir_coeff[iset], axis=[0])
+            cderi_uov[iset][p0:p1] = occ_coeff_sorted.T @ j3c @ vir_coeff_sorted
     t1 = log.timer("generate and transform 3c-2e ERI", *t1)
 
     # === step 3: decompose 3c-2e ERI ===
@@ -774,13 +775,12 @@ def get_cderi_uov_direct_incore_gpu(
         for iset in range(nset):
             cderi_uov[iset] = cupyx.scipy.linalg.solve_triangular(j2c_l, cderi_uov[iset].reshape((naux, -1)), lower=True, overwrite_b=True)
     elif j2c_decomp["tag"] == "eig":
-        j2c_l_inv = j2c_decomp["j2c_l_inv"][[np.ix_((intopt.aux_ao_idx, intopt.aux_ao_idx))]]
-        j2c_l_inv = cp.asarray(j2c_l_inv, dtype=dtype_decomp, order="C")
+        j2c_l_inv = cp.asarray(j2c_decomp["j2c_l_inv"], dtype=dtype_decomp, order="C")
         for iset in range(nset):
             cderi_uov[iset] = (j2c_l_inv @ cderi_uov[iset].reshape((naux, -1)))
     else:
         raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
-    t1 = log.timer("decompose 3c-2e ERI", *t1)
+    log.timer("decompose 3c-2e ERI", *t1)
 
     # === step 4: return cderi_uov ===
     # correctify shape
@@ -791,6 +791,7 @@ def get_cderi_uov_direct_incore_gpu(
         for iset in range(nset):
             cderi_uov[iset] = cderi_uov[iset].astype(dtype)
 
+    cp.cuda.get_current_stream().synchronize()
     log.timer("generate cderi_uov in GPU incore", *t0)
     if unsqueeze_nset:
         cderi_uov = cderi_uov[0]

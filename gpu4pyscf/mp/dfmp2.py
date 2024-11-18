@@ -100,34 +100,32 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
     #   This is not the same to numpy/CPU, since no replacement of CUDA stream on CPU.
     # Batch size (occupied) nither be too small (causes memory bandwidh consumption),
     #   nor too large (no prefetching of host-to-device transfer if cderi stored on CPU).
-    stream = cp.cuda.get_current_stream()
-    with stream:
-        eng_bi1 = 0
-        eng_bi2 = 0
-        for ptr_i in range(0, nocc, batch_occ):
-            log.debug(f"Load cderi step {ptr_i}/{nocc}")
-            nbatch_i = min(batch_occ, nocc - ptr_i)
-            cderi_uov_batch_i = cp.asarray(cderi_uov[:, ptr_i:ptr_i+nbatch_i])
-            for ptr_j in range(0, ptr_i + nbatch_i, batch_occ):
-                nbatch_j = min(batch_occ, ptr_i + nbatch_i - ptr_j)
-                cderi_uov_batch_j = cp.asarray(cderi_uov[:, ptr_j:ptr_j+nbatch_j])
-                for i in range(ptr_i, ptr_i + nbatch_i):
-                    for j in range(ptr_j, min(ptr_j + nbatch_j, i + 1)):
-                        factor = 2 if i != j else 1
-                        g_ab = cderi_uov_batch_i[:, i-ptr_i].T @ cderi_uov_batch_j[:, j-ptr_j]
-                        d_ab = occ_energy[i] + occ_energy[j] + d_vv_gpu
-                        t_ab = g_ab / d_ab
-                        eng_bi1 += factor * (t_ab * g_ab).sum()
-                        eng_bi2 += factor * (t_ab.T * g_ab).sum()
-                        if with_t2:
-                            t2[i, j, :, :] = t_ab
-                            t2[j, i, :, :] = t_ab.T
+    eng_bi1 = 0
+    eng_bi2 = 0
+    for ptr_i in range(0, nocc, batch_occ):
+        log.debug(f"Load cderi step {ptr_i}/{nocc}")
+        nbatch_i = min(batch_occ, nocc - ptr_i)
+        cderi_uov_batch_i = cp.asarray(cderi_uov[:, ptr_i:ptr_i+nbatch_i])
+        for ptr_j in range(0, ptr_i + nbatch_i, batch_occ):
+            nbatch_j = min(batch_occ, ptr_i + nbatch_i - ptr_j)
+            cderi_uov_batch_j = cp.asarray(cderi_uov[:, ptr_j:ptr_j+nbatch_j])
+            for i in range(ptr_i, ptr_i + nbatch_i):
+                for j in range(ptr_j, min(ptr_j + nbatch_j, i + 1)):
+                    factor = 2 if i != j else 1
+                    g_ab = cderi_uov_batch_i[:, i-ptr_i].T @ cderi_uov_batch_j[:, j-ptr_j]
+                    d_ab = occ_energy[i] + occ_energy[j] + d_vv_gpu
+                    t_ab = g_ab / d_ab
+                    eng_bi1 += factor * (t_ab * g_ab).sum()
+                    eng_bi2 += factor * (t_ab.T * g_ab).sum()
+                    if with_t2:
+                        t2[i, j, :, :] = t_ab
+                        t2[j, i, :, :] = t_ab.T
 
-        eng_os = eng_bi1
-        eng_ss = eng_bi1 - eng_bi2
+    eng_os = eng_bi1
+    eng_ss = eng_bi1 - eng_bi2
 
-    stream.synchronize()
-    log.timer("kernel_cderi_on_cpu", *t0)
+    cp.cuda.get_current_stream().synchronize()
+    log.timer("kernel_cderi_of_mp2", *t0)
 
     result = {
         "e_corr_os": float(eng_os),
