@@ -1,3 +1,4 @@
+from . import addons
 from . import mp2
 from . import dfmp2
 
