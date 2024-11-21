@@ -20,6 +20,7 @@ from gpu4pyscf.mp.addons import (
     CONFIG_FP_TYPE,
     CONFIG_FP_TYPE_DECOMP,
     CONFIG_CDERI_ON_GPU,
+    CONFIG_BUILD_CDERI_ON_GPU,
     CONFIG_J2C_ALG,
 )
 
@@ -138,7 +139,7 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
 
 def ao2mo(
         mp, auxmol=None, mo_coeff=None, mo_occ=None, frozen=None,
-        cderi_on_gpu=None, with_cderi_uov=None,
+        cderi_on_gpu=None, build_cderi_on_gpu=None, with_cderi_uov=None,
         fp_type=None, fp_type_decomp=None, j2c_alg=None, verbose=None, max_memory=None):
     """ Wrapper function to generate Cholesky decomposed 3c-2e ERI.
 
@@ -160,6 +161,9 @@ def ao2mo(
 
         cderi_on_gpu: bool
             Whether generate and store Cholesky decomposed 3c-2e ERI on GPU.
+
+        build_cderi_on_gpu: bool
+            Whether build cderi on GPU. Ignored (set to true) when ``cderi_on_gpu = True``.
 
         with_cderi_uov: bool
             Whether save Cholesky decomposed 3c-2e ERI in class attribute.
@@ -199,7 +203,7 @@ def ao2mo(
 
     _, occ_coeff, vir_coeff, _ = mp.split_mo_coeff(mo_coeff, frozen=frozen, mo_occ=mo_occ)
 
-    if cderi_on_gpu is False:
+    if cderi_on_gpu is False and build_cderi_on_gpu is False:
         if isinstance(occ_coeff, cp.ndarray):
             occ_coeff = occ_coeff.get()
             vir_coeff = vir_coeff.get()
@@ -207,16 +211,14 @@ def ao2mo(
             mol, auxmol, occ_coeff, vir_coeff,
             fp_type=fp_type, fp_type_decomp=fp_type_decomp, j2c_alg=j2c_alg, verbose=verbose, max_memory=max_memory)
         mp.j2c_decomp = cderi_result["j2c_decomp"]
-    elif cderi_on_gpu is True:
+    else:
         occ_coeff = cp.asarray(occ_coeff)
         vir_coeff = cp.asarray(vir_coeff)
         cderi_result = get_cderi_uov_direct_incore_gpu(
             mol, auxmol, occ_coeff, vir_coeff,
-            fp_type=fp_type, fp_type_decomp=fp_type_decomp, j2c_alg=j2c_alg, verbose=verbose, max_memory=max_memory)
+            fp_type=fp_type, fp_type_decomp=fp_type_decomp, cderi_on_gpu=cderi_on_gpu, j2c_alg=j2c_alg, verbose=verbose)
         mp.j2c_decomp = cderi_result["j2c_decomp"]
         mp.intopt = cderi_result["intopt"]
-    else:
-        raise NotImplementedError
     if with_cderi_uov:
         mp.cderi_uov = cderi_result["cderi_uov"]
     return cderi_result["cderi_uov"]
@@ -224,9 +226,8 @@ def ao2mo(
 
 class DFMP2(GPUMP2):
     _keys = {
-        "with_df", "auxbasis",
-        "with_t2", "cderi_on_gpu", "with_cderi_uov", "fp_type_decomp", "mo_energy", "fp_type", "j2c_alg",
-        "j2c_decomp", "intopt", "t2", "cderi_uov"
+        "with_df", "auxbasis", "mo_energy", "j2c_decomp", "intopt", "t2", "cderi_uov",
+        "with_t2", "cderi_on_gpu", "build_cderi_on_gpu", "with_cderi_uov", "fp_type_decomp", "fp_type", "j2c_alg",
     }
 
     def __init__(self, mf, frozen=None, auxbasis=None, mo_coeff=None, mo_occ=None, mo_energy=None):
@@ -252,6 +253,7 @@ class DFMP2(GPUMP2):
         self.fp_type_decomp = CONFIG_FP_TYPE_DECOMP
         self.with_cderi_uov = CONFIG_WITH_CDERI_UOV
         self.cderi_on_gpu = CONFIG_CDERI_ON_GPU
+        self.build_cderi_on_gpu = CONFIG_BUILD_CDERI_ON_GPU
         self.j2c_alg = CONFIG_J2C_ALG
 
         # output intermediates or results, should not be modified by user
@@ -348,6 +350,7 @@ if __name__ == "__main__":
         # cderi on cpu
         # function calls can be validated in output
         mp = DFMP2(mf).run(cderi_on_gpu=False)
+        print(mp.e_corr)
         assert np.isclose(mp.e_corr, e_ref)
 
     def mf_on_gpu():
@@ -367,7 +370,7 @@ if __name__ == "__main__":
 
         # cderi on cpu
         # function calls can be validated in output
-        mp = DFMP2(mf).run(cderi_on_gpu=False)
+        mp = DFMP2(mf).run(cderi_on_gpu=False, fp_type="FP32")
         assert np.isclose(mp.e_corr, e_ref)
 
     mf_on_cpu()

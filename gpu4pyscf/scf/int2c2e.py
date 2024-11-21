@@ -74,7 +74,8 @@ def get_int2c2e_sorted(mol, intopt=None, direct_scf_tol=1e-13, aosym=None, omega
             if err != 0:
                 raise RuntimeError("int2c2e failed\n")
 
-    int2c[rows, cols] = int2c[cols, rows]
+    int2c = int2c + int2c.T
+    cupy.fill_diagonal(int2c, int2c.diagonal() / 2)
     if not mol.cart:
         coeff = intopt.cart2sph
         int2c = coeff.T @ int2c @ coeff

@@ -1,20 +1,25 @@
 """
 GPU4PySCF config and utilities for MP2 module
 """
-
+import cupy.cuda
 import pyscf
 import gpu4pyscf
 import numpy as np
 import cupy as cp
 import scipy
 
+from gpu4pyscf.lib.cupy_helper import get_avail_mem as get_avail_gpu_mem
+
 import cupyx.scipy.linalg
+import gpu4pyscf.lib.logger
+import gpu4pyscf.df.int3c2e
+import pyscf.df.incore
 from pyscf import __config__
 
 # region GPU4PySCF config
 
 CONFIG_USE_SCF_WITH_DF = getattr(__config__, "gpu_mp_dfmp2_use_scf_with_df", False)
-""" Flag for using cderi from SCF object.
+""" Flag for using cderi from SCF object (not implemented).
 
 This option will be overrided if auxiliary basis set is explicitly specified.
 
@@ -29,12 +34,16 @@ In many cases, this is not recommended, except for debugging.
 Energy (or possibly gradient in future) can be computed without T2 amplitude.
 """
 
+CONFIG_WITH_CDERI_UOV = getattr(__config__, "gpu_mp_dfmp2_with_cderi_uov", False)
+""" Flag for save Cholesky decomposed 3c-2e ERI (occ-vir part). """
+
 CONFIG_FP_TYPE = getattr(__config__, "gpu_mp_dfmp2_fp_type", "FP64")
 """ Floating point type for MP2 calculation.
 
 Currently only FP64 and FP32 are supported.
 To use TF32, set environment variable ``CUPY_TF32=1`` before running python / importing cupy, and set ``FP32`` for this option.
 Use TF32 with caution for RI-MP2. TF32 is not recommended when performing LT-OS-MP2.
+
 - FP64: Double precision
 - FP32: Single precision
 """
@@ -43,24 +52,30 @@ CONFIG_FP_TYPE_DECOMP = getattr(__config__, "gpu_mp_dfmp2_same_fp_type_decomp", 
 """ Flag for using the same floating point type for decomposition.
 
 Note that ERI is always generated in FP64. This only affects the decomposition.
+
 - None: Use the same floating point type as the MP2 calculation.
 - FP64: Double precision
 - FP32: Single precision
 """
 
 CONFIG_CDERI_ON_GPU = getattr(__config__, "gpu_mp_dfmp2_cderi_on_gpu", True)
-""" Flag for generating cderi (MO part) on GPU.
+""" Flag for storing cderi (MO part) on GPU.
 
 - None: (not implemented) Automatically choose based on the available GPU memory.
-- True: Always generate cderi on GPU DRAM.
-- False: Always generate cderi on CPU DRAM.
+- True: Always storing cderi on GPU DRAM.
+- False: Always storing cderi on CPU DRAM.
 """
 
-CONFIG_WITH_CDERI_UOV = getattr(__config__, "gpu_mp_dfmp2_with_cderi_uov", False)
-""" Flag for save Cholesky decomposed 3c-2e ERI (occ-vir part). """
+CONFIG_BUILD_CDERI_ON_GPU = getattr(__config__, "gpu_mp_dfmp2_build_cderi_on_gpu", True)
+""" Flag for allow generating cderi (MO part) on GPU.
+
+This option may be useful if `cderi_on_gpu=False`; all computations will be on GPU, but
+storing cderi on CPU in this case (using GPU as cache buffer).
+"""
 
 CONFIG_J2C_ALG = getattr(__config__, "gpu_mp_dfmp2_j2c_alg", "cd")
 """ Algorithm for j2c decomposition.
+
 - "cd": Cholesky decomposition
 - "eig": Eigen decomposition
 """
@@ -73,7 +88,7 @@ MIN_BATCH_AUX_GPU = 32
 BLKSIZE_AO = 128
 CUTOFF_J3C = 1e-10
 
-#endregion
+# endregion
 
 
 # region utilities of post-SCF
@@ -288,7 +303,9 @@ def generator_int3c2e_cpu(mol, auxmol, intor, aosym):
 
 
 def get_cderi_uov_direct_incore_cpu(
-        mol, auxmol, occ_coeff, vir_coeff, fp_type=CONFIG_FP_TYPE, fp_type_decomp=CONFIG_FP_TYPE_DECOMP, j2c_alg=CONFIG_J2C_ALG, verbose=None, max_memory=None):
+        mol, auxmol, occ_coeff, vir_coeff,
+        fp_type=CONFIG_FP_TYPE, fp_type_decomp=CONFIG_FP_TYPE_DECOMP, j2c_alg=CONFIG_J2C_ALG,
+        verbose=None, max_memory=None):
     r""" Generate Cholesky decomposed 3c-2e ERI (occ-vir part) in CPU incore directly.
 
     This involves four steps:
@@ -470,6 +487,15 @@ def get_cderi_uov_direct_incore_cpu(
 
 # region ERI on GPU
 
+def get_dtype(type_token, is_gpu):
+    if type_token.upper() == "FP64":
+        return cp.float64 if is_gpu else np.float64
+    elif type_token.upper() == "FP32":
+        return cp.float32 if is_gpu else np.float32
+    else:
+        raise ValueError(f"Unknown type {type_token}")
+
+
 def get_j2c_decomp_gpu(streamobj, j2c, alg=CONFIG_J2C_ALG, thresh_lindep=CONFIG_THRESH_LINDEP, verbose=None):
     r""" Get j2c decomposition in GPU.
 
@@ -514,7 +540,6 @@ def get_j2c_decomp_gpu(streamobj, j2c, alg=CONFIG_J2C_ALG, thresh_lindep=CONFIG_
     See also:
         get_j2c_decomp_cpu
     """
-    import gpu4pyscf.lib.logger
     log = gpu4pyscf.lib.logger.new_logger(streamobj, verbose)
     t0 = log.init_timer()
 
@@ -594,8 +619,6 @@ def get_int3c2e_by_aux_id(mol, intopt, idx_k, omega=None, out=None):
                 j3c_batched = get_int3c2e_by_aux_id(mol, intopt, idx_k)
                 print(j3c_batched.shape, j3c_batched.strides)
     """
-    import gpu4pyscf.df.int3c2e
-
     nao = mol.nao
     k0, k1 = intopt.aux_ao_loc[idx_k], intopt.aux_ao_loc[idx_k+1]
 
@@ -624,8 +647,115 @@ def get_int3c2e_by_aux_id(mol, intopt, idx_k, omega=None, out=None):
     return out
 
 
+def _get_j3c_uov_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_uov):
+    """ Inner function for generate and transform 3c-2e ERI to MO basis
+
+    Args:
+        mol: pyscf.gto.Mole
+        intopt: gpu4pyscf.df.int3c2e.VHFOpt
+        occ_coeff: list[cp.ndarray]
+        vir_coeff: list[cp.ndarray]
+        j3c_uov: list[np.ndarray or cp.ndarray]
+    """
+    nset = len(occ_coeff)
+    assert len(occ_coeff) == len(vir_coeff) == len(j3c_uov)
+    j3c_on_gpu = isinstance(j3c_uov[0], cp.ndarray)
+    occ_coeff_sorted = [intopt.sort_orbitals(occ_coeff[iset], axis=[0]) for iset in range(nset)]
+    vir_coeff_sorted = [intopt.sort_orbitals(vir_coeff[iset], axis=[0]) for iset in range(nset)]
+
+    if j3c_on_gpu:
+        dtype = j3c_uov[0].dtype
+    elif j3c_uov[0].dtype == np.float64:
+        dtype = cp.float64
+    elif j3c_uov[0].dtype == np.float32:
+        dtype = cp.float32
+    else:
+        raise ValueError(f"type {j3c_uov[0].dtype} not known.")
+
+    for idx_p in range(len(intopt.aux_log_qs)):
+        if not mol.cart:
+            p0, p1 = intopt.sph_aux_loc[idx_p], intopt.sph_aux_loc[idx_p + 1]
+        else:
+            p0, p1 = intopt.cart_aux_loc[idx_p], intopt.cart_aux_loc[idx_p + 1]
+        j3c = get_int3c2e_by_aux_id(mol, intopt, idx_p)
+        for iset in range(nset):
+            co = occ_coeff_sorted[iset]
+            cv = vir_coeff_sorted[iset]
+            if j3c_on_gpu:
+                j3c_uov[iset][p0:p1] = co.T @ j3c @ cv
+            else:
+                (co.T @ j3c @ cv).astype(dtype).get(out=j3c_uov[iset][p0:p1], blocking=False)
+    cupy.cuda.get_current_stream().synchronize()
+
+
+def _decompose_j3c(j2c_decomp, j3c):
+    """ Inner function for decompose 3c-2e ERI
+
+    Args:
+        j2c_decomp: dict
+        j3c: list[np.ndarray or cp.ndarray]
+    """
+    j3c_on_gpu = isinstance(j3c[0], cp.ndarray)
+    nset = len(j3c)
+    naux = j3c[0].shape[0]
+    dtype = j3c[0].dtype
+
+    if j3c_on_gpu:
+        # directly perform decomposition
+        if j2c_decomp["tag"] == "cd":
+            j2c_l = cp.asarray(j2c_decomp["j2c_l"], dtype=dtype, order="C")
+            # probably memory copy occurs due to c-contiguous array?
+            for iset in range(nset):
+                shape = j3c[iset].shape
+                j3c[iset] = cupyx.scipy.linalg.solve_triangular(
+                    j2c_l, j3c[iset].reshape((naux, -1)), lower=True, overwrite_b=True).reshape(shape)
+        elif j2c_decomp["tag"] == "eig":
+            j2c_l_inv = cp.asarray(j2c_decomp["j2c_l_inv"], dtype=dtype, order="C")
+            for iset in range(nset):
+                shape = j3c[iset].shape
+                j3c[iset] = (j2c_l_inv @ j3c[iset].reshape((naux, -1))).reshape(shape)
+        else:
+            raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
+    else:
+        max_memory = get_avail_gpu_mem() / 1024**2
+        mem_avail = max(max_memory, get_avail_gpu_mem() / 1024**2)
+        fp_avail = 0.7 * mem_avail * 1024**2 / min(j3c[0].strides)
+        if j2c_decomp["tag"] == "cd":
+            j2c_l = cp.asarray(j2c_decomp["j2c_l"], dtype=dtype, order="C")
+            for iset in range(nset):
+                shape = j3c[iset].shape
+                j3c[iset].shape = (naux, -1)
+                n_ov = j3c[iset].shape[1]
+                batch_ov = int(fp_avail / (2 * naux))
+                for i_ov in range(0, n_ov, batch_ov):
+                    nbatch_ov = min(batch_ov, n_ov - i_ov)
+                    j3c_batched = cp.asarray(j3c[iset][:, i_ov:i_ov+nbatch_ov])
+                    j3c_batched = cupyx.scipy.linalg.solve_triangular(
+                        j2c_l, j3c_batched, lower=True, overwrite_b=True)
+                    j3c[iset][:, i_ov:i_ov+nbatch_ov] = j3c_batched.get(blocking=False)
+                j3c[iset].shape = shape
+        elif j2c_decomp["tag"] == "eig":
+            j2c_l_inv = cp.asarray(j2c_decomp["j2c_l_inv"], dtype=dtype, order="C")
+            for iset in range(nset):
+                shape = j3c[iset].shape
+                j3c[iset].shape = (naux, -1)
+                n_ov = j3c[iset].shape[1]
+                batch_ov = int(fp_avail / (2 * naux))
+                for i_ov in range(0, n_ov, batch_ov):
+                    nbatch_ov = min(batch_ov, n_ov - i_ov)
+                    j3c_batched = cp.asarray(j3c[iset][:, i_ov:i_ov+nbatch_ov])
+                    j3c[iset][:, i_ov:i_ov+nbatch_ov] = (j2c_l_inv @ j3c_batched).get(blocking=False)
+                j3c[iset].shape = shape
+        else:
+            raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
+    cupy.cuda.get_current_stream().synchronize()
+
+
 def get_cderi_uov_direct_incore_gpu(
-        mol, auxmol, occ_coeff, vir_coeff, fp_type=CONFIG_FP_TYPE, fp_type_decomp=CONFIG_FP_TYPE_DECOMP, j2c_alg=CONFIG_J2C_ALG, verbose=None, max_memory=None):
+        mol, auxmol, occ_coeff, vir_coeff,
+        fp_type=CONFIG_FP_TYPE, fp_type_decomp=CONFIG_FP_TYPE_DECOMP, j2c_alg=CONFIG_J2C_ALG,
+        cderi_on_gpu=True,
+        verbose=None):
     r""" Generate Cholesky decomposed 3c-2e ERI (occ-vir part) in GPU incore directly.
 
     Note:
@@ -657,15 +787,15 @@ def get_cderi_uov_direct_incore_gpu(
             - FP64: Double precision
             - FP32: Single precision
 
+        cderi_on_gpu: bool
+            Whether store cderi on GPU.
+
         j2c_alg: str
             Algorithm for decomposition.
             - "cd": Cholesky decomposition by default, eigen decomposition when scipy raises error
             - "eig": Eigen decomposition
 
         verbose: int or None
-
-        max_memory: float or None
-            Max memory in MB in GPU. If None, use all GPU available memory.
 
     Returns:
         dict
@@ -682,12 +812,8 @@ def get_cderi_uov_direct_incore_gpu(
     See also:
         get_cderi_uov_direct_incore_cpu
     """
-    import gpu4pyscf.lib.logger
-    import gpu4pyscf.df.int3c2e
-    from pyscf.df.incore import fill_2c2e
-    from gpu4pyscf.lib.cupy_helper import get_avail_mem
-
     log = gpu4pyscf.lib.logger.new_logger(mol, verbose)
+    t0 = log.init_timer()
 
     # sanity check and options update
     # only one set of coefficients
@@ -713,26 +839,27 @@ def get_cderi_uov_direct_incore_gpu(
 
     # memory requirement
     assert fp_type.upper() in ["FP64", "FP32"]
-    max_memory = get_avail_mem() / 1024**2 if max_memory is None else max_memory
-    fp_required = sum([naux * nocc * nvir for (nocc, nvir) in zip(nocc_list, nvir_list)]) + 2 * naux * naux
 
     fp_type_decomp = fp_type if fp_type_decomp is None else fp_type_decomp
 
-    dtype = cp.float64 if fp_type.upper() == "FP64" else cp.float32
-    dtype_decomp = cp.float64 if fp_type_decomp.upper() == "FP64" else cp.float32
-
     # this array will be both scratch and output, so naming is a bit tricky
     # also note that before decomposition, dtype must be FP64
-    cderi_uov = [cp.empty([naux, nocc, nvir], dtype=cp.float64) for (nocc, nvir) in zip(nocc_list, nvir_list)]
+    if cderi_on_gpu:
+        cderi_uov = [cp.empty([naux, nocc, nvir], dtype=get_dtype(fp_type_decomp, True))
+                     for (nocc, nvir) in zip(nocc_list, nvir_list)]
+    else:
+        cderi_uov = [np.empty([naux, nocc, nvir], dtype=get_dtype(fp_type_decomp, False))
+                     for (nocc, nvir) in zip(nocc_list, nvir_list)]
 
-    t0 = log.init_timer()
     t1 = log.init_timer()
 
     # === step 0: generate intopt object ===
     # this object need to be generated before j2c, due to orbital rearrangement
-    mem_avail = max(max_memory, get_avail_mem() / 1024**2)
+    # except for output, j3c_uov must be evaluated by FP64 (8 Bytes)
+    mem_avail = get_avail_gpu_mem() / 1024**2
+    fp_required = 2 * naux * naux + nset * nao * nao  # j2c, orbital coefficients
     fp_avail = 0.7 * mem_avail * 1024**2 / 8 - fp_required
-    batch_aux = fp_avail / (nao * nao)
+    batch_aux = int(fp_avail / (2 * nao * nao))
     if batch_aux <= MIN_BATCH_AUX_GPU:
         log.warn(f"Auxiliary batch {batch_aux} number too small. Try set to {MIN_BATCH_AUX_GPU} anyway.")
         batch_aux = MIN_BATCH_AUX_GPU
@@ -740,7 +867,7 @@ def get_cderi_uov_direct_incore_gpu(
     intopt.build(CUTOFF_J3C, diag_block_with_triu=True, aosym=True, group_size=BLKSIZE_AO, group_size_aux=batch_aux)
 
     # === step 0: generate 2c-2e ERI and decomposition ===
-    j2c = cp.asarray(fill_2c2e(mol, auxmol))
+    j2c = cp.asarray(pyscf.df.incore.fill_2c2e(mol, auxmol))
     j2c = intopt.sort_orbitals(j2c, aux_axis=[0, 1])
     j2c_decomp = get_j2c_decomp_gpu(mol, j2c, alg=j2c_alg, verbose=verbose)
     if "j2c_l" in j2c_decomp:
@@ -751,47 +878,23 @@ def get_cderi_uov_direct_incore_gpu(
 
     # === step 1: generate 3c-2e ERI ===
     # === step 2: transform 3c-2e ERI to MO basis ===
-    # coefficients
-    for idx_p in range(len(intopt.aux_log_qs)):
-        if not mol.cart:
-            p0, p1 = intopt.sph_aux_loc[idx_p], intopt.sph_aux_loc[idx_p + 1]
-        else:
-            p0, p1 = intopt.cart_aux_loc[idx_p], intopt.cart_aux_loc[idx_p + 1]
-        j3c = get_int3c2e_by_aux_id(mol, intopt, idx_p)
-        for iset in range(nset):
-            occ_coeff_sorted = intopt.sort_orbitals(occ_coeff[iset], axis=[0])
-            vir_coeff_sorted = intopt.sort_orbitals(vir_coeff[iset], axis=[0])
-            cderi_uov[iset][p0:p1] = occ_coeff_sorted.T @ j3c @ vir_coeff_sorted
+    _get_j3c_uov_gpu(mol, intopt, occ_coeff, vir_coeff, cderi_uov)
     t1 = log.timer("generate and transform 3c-2e ERI", *t1)
 
     # === step 3: decompose 3c-2e ERI ===
     # transform dtype if necessary
-    if dtype_decomp is not cp.float64:
-        for iset in range(nset):
-            cderi_uov[iset] = cderi_uov[iset].astype(dtype_decomp)
-    if j2c_decomp["tag"] == "cd":
-        j2c_l = cp.asarray(j2c_decomp["j2c_l"], dtype=dtype_decomp, order="C")
-        # probably memory copy occurs due to c-contiguous array?
-        for iset in range(nset):
-            cderi_uov[iset] = cupyx.scipy.linalg.solve_triangular(j2c_l, cderi_uov[iset].reshape((naux, -1)), lower=True, overwrite_b=True)
-    elif j2c_decomp["tag"] == "eig":
-        j2c_l_inv = cp.asarray(j2c_decomp["j2c_l_inv"], dtype=dtype_decomp, order="C")
-        for iset in range(nset):
-            cderi_uov[iset] = (j2c_l_inv @ cderi_uov[iset].reshape((naux, -1)))
-    else:
-        raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
+    _decompose_j3c(j2c_decomp, cderi_uov)
     log.timer("decompose 3c-2e ERI", *t1)
 
     # === step 4: return cderi_uov ===
     # correctify shape
     for iset in range(nset):
         cderi_uov[iset].shape = (naux, nocc_list[iset], nvir_list[iset])
-
-    if dtype != dtype_decomp:
+    if fp_type_decomp != fp_type:
         for iset in range(nset):
-            cderi_uov[iset] = cderi_uov[iset].astype(dtype)
-
+            cderi_uov[iset] = cderi_uov[iset].astype(get_dtype(fp_type, cderi_on_gpu))
     cp.cuda.get_current_stream().synchronize()
+
     log.timer("generate cderi_uov in GPU incore", *t0)
     if unsqueeze_nset:
         cderi_uov = cderi_uov[0]
