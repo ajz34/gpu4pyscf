@@ -9,7 +9,8 @@ import numpy as np
 
 import gpu4pyscf.df
 import gpu4pyscf.lib.logger
-from gpu4pyscf.lib.cupy_helper import tag_array, get_avail_mem
+from gpu4pyscf.lib.cupy_helper import tag_array
+from gpu4pyscf.lib.cupy_helper import get_avail_mem as get_avail_gpu_mem
 from gpu4pyscf.mp.mp2 import MP2 as GPUMP2
 import gpu4pyscf.df.int3c2e
 
@@ -82,12 +83,12 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
     else:
         t2 = None
 
-    max_memory = mp.mol.max_memory if max_memory is None else max_memory
-    mem_avail = max(max_memory, get_avail_mem() / 1024**2)
-    fp_size = 8 if dtype == np.float64 else 4
-    fp_avail = 0.7 * mem_avail * 1024**2 / fp_size
+    cp.get_default_memory_pool().free_all_blocks()
+    log.debug(f"Available GPU memory: {get_avail_gpu_mem() / 1024**3:.6f} GB")
+    fp_size = min(cderi_uov.strides)
+    fp_avail = 0.7 * get_avail_gpu_mem() / fp_size
     # minimum occ batch is hardcoded to 256
-    batch_occ = min(fp_avail / (4 * naux * nvir), MAX_BATCH_OCC)
+    batch_occ = min(int(fp_avail / (2 * naux * nvir)), MAX_BATCH_OCC)
     log.debug(f"number of batched occupied orbitals: {batch_occ}")
 
     # preparation
@@ -109,7 +110,10 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
         cderi_uov_batch_i = cp.asarray(cderi_uov[:, ptr_i:ptr_i+nbatch_i])
         for ptr_j in range(0, ptr_i + nbatch_i, batch_occ):
             nbatch_j = min(batch_occ, ptr_i + nbatch_i - ptr_j)
-            cderi_uov_batch_j = cp.asarray(cderi_uov[:, ptr_j:ptr_j+nbatch_j])
+            if ptr_i == ptr_j:
+                cderi_uov_batch_j = cderi_uov_batch_i
+            else:
+                cderi_uov_batch_j = cp.asarray(cderi_uov[:, ptr_j:ptr_j+nbatch_j])
             for i in range(ptr_i, ptr_i + nbatch_i):
                 for j in range(ptr_j, min(ptr_j + nbatch_j, i + 1)):
                     factor = 2 if i != j else 1
@@ -121,6 +125,8 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
                     if with_t2:
                         t2[i, j, :, :] = t_ab
                         t2[j, i, :, :] = t_ab.T
+            cderi_uov_batch_j = None
+        cderi_uov_batch_i = None
 
     eng_os = eng_bi1
     eng_ss = eng_bi1 - eng_bi2
@@ -234,6 +240,8 @@ class DFMP2(GPUMP2):
         super().__init__(mf, frozen, mo_coeff, mo_occ)
         if not mf.converged:
             raise RuntimeError("SCF must be converged to perform DFMP2. Non-canonical DFMP2 currently not implemented.")
+        else:
+            self.e_hf = mf.e_tot
         self.mo_energy = mf.mo_energy if mo_energy is None else mo_energy
 
         # auxiliary and cderi configuration
@@ -299,7 +307,8 @@ class DFMP2(GPUMP2):
             self.check_sanity()
         self.dump_flags()
 
-        self.e_hf = self.get_e_hf(mo_coeff=mo_coeff)
+        if self.e_hf in [None, NotImplemented]:
+            self.e_hf = self.get_e_hf(mo_coeff=mo_coeff)
 
         if eris is None:
             eris = self.ao2mo()

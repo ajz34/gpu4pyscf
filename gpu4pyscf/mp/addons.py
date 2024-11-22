@@ -685,10 +685,11 @@ def _get_j3c_uov_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_uov):
                 j3c_uov[iset][p0:p1] = co.T @ j3c @ cv
             else:
                 (co.T @ j3c @ cv).astype(dtype).get(out=j3c_uov[iset][p0:p1], blocking=False)
+        j3c = None
     cupy.cuda.get_current_stream().synchronize()
 
 
-def _decompose_j3c(j2c_decomp, j3c):
+def _decompose_j3c(j2c_decomp, j3c, log):
     """ Inner function for decompose 3c-2e ERI
 
     Args:
@@ -717,22 +718,24 @@ def _decompose_j3c(j2c_decomp, j3c):
         else:
             raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
     else:
-        max_memory = get_avail_gpu_mem() / 1024**2
-        mem_avail = max(max_memory, get_avail_gpu_mem() / 1024**2)
-        fp_avail = 0.7 * mem_avail * 1024**2 / min(j3c[0].strides)
+        cp.get_default_memory_pool().free_all_blocks()
+        log.debug(f"Available GPU memory: {get_avail_gpu_mem() / 1024**3:.6f} GB")
+        fp_avail = 0.7 * get_avail_gpu_mem() / min(j3c[0].strides)
         if j2c_decomp["tag"] == "cd":
             j2c_l = cp.asarray(j2c_decomp["j2c_l"], dtype=dtype, order="C")
             for iset in range(nset):
                 shape = j3c[iset].shape
                 j3c[iset].shape = (naux, -1)
                 n_ov = j3c[iset].shape[1]
-                batch_ov = int(fp_avail / (2 * naux))
+                batch_ov = int(fp_avail / (4 * naux))
+                log.debug(f"number of batched occ-vir orbitals: {batch_ov}")
                 for i_ov in range(0, n_ov, batch_ov):
                     nbatch_ov = min(batch_ov, n_ov - i_ov)
                     j3c_batched = cp.asarray(j3c[iset][:, i_ov:i_ov+nbatch_ov])
                     j3c_batched = cupyx.scipy.linalg.solve_triangular(
                         j2c_l, j3c_batched, lower=True, overwrite_b=True)
                     j3c[iset][:, i_ov:i_ov+nbatch_ov] = j3c_batched.get(blocking=False)
+                    j3c_batched = None
                 j3c[iset].shape = shape
         elif j2c_decomp["tag"] == "eig":
             j2c_l_inv = cp.asarray(j2c_decomp["j2c_l_inv"], dtype=dtype, order="C")
@@ -740,11 +743,12 @@ def _decompose_j3c(j2c_decomp, j3c):
                 shape = j3c[iset].shape
                 j3c[iset].shape = (naux, -1)
                 n_ov = j3c[iset].shape[1]
-                batch_ov = int(fp_avail / (2 * naux))
+                batch_ov = int(fp_avail / (4 * naux))
                 for i_ov in range(0, n_ov, batch_ov):
                     nbatch_ov = min(batch_ov, n_ov - i_ov)
                     j3c_batched = cp.asarray(j3c[iset][:, i_ov:i_ov+nbatch_ov])
                     j3c[iset][:, i_ov:i_ov+nbatch_ov] = (j2c_l_inv @ j3c_batched).get(blocking=False)
+                    j3c_batched = None
                 j3c[iset].shape = shape
         else:
             raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
@@ -856,10 +860,12 @@ def get_cderi_uov_direct_incore_gpu(
     # === step 0: generate intopt object ===
     # this object need to be generated before j2c, due to orbital rearrangement
     # except for output, j3c_uov must be evaluated by FP64 (8 Bytes)
-    mem_avail = get_avail_gpu_mem() / 1024**2
+    cp.get_default_memory_pool().free_all_blocks()
+    log.debug(f"Available GPU memory: {get_avail_gpu_mem() / 1024**3:.6f} GB")
     fp_required = 2 * naux * naux + nset * nao * nao  # j2c, orbital coefficients
-    fp_avail = 0.7 * mem_avail * 1024**2 / 8 - fp_required
-    batch_aux = int(fp_avail / (2 * nao * nao))
+    fp_avail = 0.7 * get_avail_gpu_mem() / 8 - fp_required
+    batch_aux = int(fp_avail / (3 * nao * nao))
+    log.debug(f"number of batched auxiliary orbitals: {batch_aux}")
     if batch_aux <= MIN_BATCH_AUX_GPU:
         log.warn(f"Auxiliary batch {batch_aux} number too small. Try set to {MIN_BATCH_AUX_GPU} anyway.")
         batch_aux = MIN_BATCH_AUX_GPU
@@ -867,13 +873,15 @@ def get_cderi_uov_direct_incore_gpu(
     intopt.build(CUTOFF_J3C, diag_block_with_triu=True, aosym=True, group_size=BLKSIZE_AO, group_size_aux=batch_aux)
 
     # === step 0: generate 2c-2e ERI and decomposition ===
-    j2c = cp.asarray(pyscf.df.incore.fill_2c2e(mol, auxmol))
+    j2c = pyscf.df.incore.fill_2c2e(mol, auxmol)
     j2c = intopt.sort_orbitals(j2c, aux_axis=[0, 1])
+    j2c = cp.asarray(j2c, dtype=get_dtype(fp_type_decomp, True), order="C")
     j2c_decomp = get_j2c_decomp_gpu(mol, j2c, alg=j2c_alg, verbose=verbose)
     if "j2c_l" in j2c_decomp:
         j2c_decomp["j2c_l"] = cp.asarray(j2c_decomp["j2c_l"])
     if "j2c_l_inv" in j2c_decomp:
         j2c_decomp["j2c_l_inv"] = cp.asarray(j2c_decomp["j2c_l_inv"])
+    j2c = None
     t1 = log.timer("generate 2c-2e ERI and decomposition", *t1)
 
     # === step 1: generate 3c-2e ERI ===
@@ -883,7 +891,7 @@ def get_cderi_uov_direct_incore_gpu(
 
     # === step 3: decompose 3c-2e ERI ===
     # transform dtype if necessary
-    _decompose_j3c(j2c_decomp, cderi_uov)
+    _decompose_j3c(j2c_decomp, cderi_uov, log)
     log.timer("decompose 3c-2e ERI", *t1)
 
     # === step 4: return cderi_uov ===
