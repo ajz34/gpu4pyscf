@@ -17,11 +17,10 @@ import gpu4pyscf.df.int3c2e
 from gpu4pyscf.mp.addons import (
     CONFIG_USE_SCF_WITH_DF,
     CONFIG_WITH_T2,
-    CONFIG_WITH_CDERI_UOV,
+    CONFIG_WITH_CDERI_OVL,
     CONFIG_FP_TYPE,
     CONFIG_FP_TYPE_DECOMP,
     CONFIG_CDERI_ON_GPU,
-    CONFIG_BUILD_CDERI_ON_GPU,
     CONFIG_J2C_ALG,
 )
 
@@ -29,14 +28,14 @@ MAX_BATCH_OCC = 256
 """ Maximum batched occupation number in MP2. """
 
 
-def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None, verbose=None):
+def get_dfmp2_energy(mp, cderi_ovl, occ_energy, vir_energy, with_t2=None, verbose=None):
     """ DFMP2 (restricted) main function.
 
     Args:
         mp: gpu4pyscf.mp.dfmp2.DFMP2
 
-        cderi_uov: np.ndarray or cp.ndarray
-            Cholesky decomposed 3c-2e ERI (occ-vir part), in shape (aux, occ, vir) and c-contiguous.
+        cderi_ovl: np.ndarray or cp.ndarray
+            Cholesky decomposed 3c-2e ERI (occ-vir part), in shape (occ, vir, aux) and c-contiguous.
 
         occ_energy: np.ndarray or list[np.ndarray]
             Occupied orbital energy levels.
@@ -46,9 +45,6 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
 
         with_t2:
             Flag for generating MP2 amplitude. Recommended to be false if not for debugging.
-
-        max_memory:
-            Maximum memory for GPU.
 
         verbose: int or None
 
@@ -71,13 +67,13 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
     with_t2 = mp.with_t2 if with_t2 is None else with_t2
     
     # sanity check
-    assert isinstance(cderi_uov, (np.ndarray, cp.ndarray))
-    naux, nocc, nvir = cderi_uov.shape
+    assert isinstance(cderi_ovl, (np.ndarray, cp.ndarray))
+    nocc, nvir, naux = cderi_ovl.shape
     assert nocc == occ_energy.size
     assert nvir == vir_energy.size
     
     # memory and type
-    dtype = cderi_uov.dtype
+    dtype = cderi_ovl.dtype
     if with_t2:
         t2 = cp.empty((nocc, nocc, nvir, nvir), dtype=dtype)
     else:
@@ -85,10 +81,10 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
 
     cp.get_default_memory_pool().free_all_blocks()
     log.debug(f"Available GPU memory: {get_avail_gpu_mem() / 1024**3:.6f} GB")
-    fp_size = min(cderi_uov.strides)
+    fp_size = min(cderi_ovl.strides)
     fp_avail = 0.7 * get_avail_gpu_mem() / fp_size
     # minimum occ batch is hardcoded to 256
-    batch_occ = min(int(fp_avail / (2 * naux * nvir)), MAX_BATCH_OCC)
+    batch_occ = min(int(fp_avail / (3 * naux * nvir)), MAX_BATCH_OCC)
     log.debug(f"number of batched occupied orbitals: {batch_occ}")
 
     # preparation
@@ -96,28 +92,24 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
     vir_energy = cp.asarray(vir_energy, dtype=dtype)
     d_vv_gpu = - vir_energy[:, None] - vir_energy[None, :]
 
-    # Note for efficiency
-    # In GPU, arithmetic intensive matmul can overlap energy reduction,
-    #   so python code here seems to be quite fast enough (cost of sum(t_ab * g_ab) may be overlapped by CUDA stream).
-    #   This is not the same to numpy/CPU, since no replacement of CUDA stream on CPU.
-    # Batch size (occupied) nither be too small (causes memory bandwidh consumption),
-    #   nor too large (no prefetching of host-to-device transfer if cderi stored on CPU).
+    # actual engine
     eng_bi1 = 0
     eng_bi2 = 0
     for ptr_i in range(0, nocc, batch_occ):
-        log.debug(f"Load cderi step {ptr_i}/{nocc}")
+        log.debug(f"Load cderi (index i) step {ptr_i}/{nocc}")
         nbatch_i = min(batch_occ, nocc - ptr_i)
-        cderi_uov_batch_i = cp.asarray(cderi_uov[:, ptr_i:ptr_i+nbatch_i])
+        cderi_ovl_batch_i = cp.asarray(cderi_ovl[ptr_i:ptr_i+nbatch_i])
         for ptr_j in range(0, ptr_i + nbatch_i, batch_occ):
+            log.debug(f"Load cderi (index j) step {ptr_j}/{nocc}")
             nbatch_j = min(batch_occ, ptr_i + nbatch_i - ptr_j)
             if ptr_i == ptr_j:
-                cderi_uov_batch_j = cderi_uov_batch_i
+                cderi_ovl_batch_j = cderi_ovl_batch_i
             else:
-                cderi_uov_batch_j = cp.asarray(cderi_uov[:, ptr_j:ptr_j+nbatch_j])
+                cderi_ovl_batch_j = cp.asarray(cderi_ovl[ptr_j:ptr_j+nbatch_j])
             for i in range(ptr_i, ptr_i + nbatch_i):
                 for j in range(ptr_j, min(ptr_j + nbatch_j, i + 1)):
                     factor = 2 if i != j else 1
-                    g_ab = cderi_uov_batch_i[:, i-ptr_i].T @ cderi_uov_batch_j[:, j-ptr_j]
+                    g_ab = cderi_ovl_batch_i[i-ptr_i] @ cderi_ovl_batch_j[j-ptr_j].T
                     d_ab = occ_energy[i] + occ_energy[j] + d_vv_gpu
                     t_ab = g_ab / d_ab
                     eng_bi1 += factor * (t_ab * g_ab).sum()
@@ -125,8 +117,8 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
                     if with_t2:
                         t2[i, j, :, :] = t_ab
                         t2[j, i, :, :] = t_ab.T
-            cderi_uov_batch_j = None
-        cderi_uov_batch_i = None
+            cderi_ovl_batch_j = None
+        cderi_ovl_batch_i = None
 
     eng_os = eng_bi1
     eng_ss = eng_bi1 - eng_bi2
@@ -145,7 +137,7 @@ def kernel(mp, cderi_uov, occ_energy, vir_energy, with_t2=None, max_memory=None,
 
 def ao2mo(
         mp, auxmol=None, mo_coeff=None, mo_occ=None, frozen=None,
-        cderi_on_gpu=None, build_cderi_on_gpu=None, with_cderi_uov=None,
+        cderi_on_gpu=None, with_cderi_ovl=None,
         fp_type=None, fp_type_decomp=None, j2c_alg=None, verbose=None, max_memory=None):
     """ Wrapper function to generate Cholesky decomposed 3c-2e ERI.
 
@@ -168,14 +160,11 @@ def ao2mo(
         cderi_on_gpu: bool
             Whether generate and store Cholesky decomposed 3c-2e ERI on GPU.
 
-        build_cderi_on_gpu: bool
-            Whether build cderi on GPU. Ignored (set to true) when ``cderi_on_gpu = True``.
-
-        with_cderi_uov: bool
+        with_cderi_ovl: bool
             Whether save Cholesky decomposed 3c-2e ERI in class attribute.
 
         fp_type: str
-            Floating point type for final returned cderi_uov (step 4).
+            Floating point type for final returned cderi_ovl (step 4).
 
             - FP64: Double precision
             - FP32: Single precision
@@ -196,7 +185,7 @@ def ao2mo(
         max_memory: float or None
             Max memory in MB in CPU or GPU, depending on where Cholesky decomposed 3c-2e ERI is stored.
     """
-    from gpu4pyscf.mp.addons import get_cderi_uov_direct_incore_cpu, get_cderi_uov_direct_incore_gpu
+    from gpu4pyscf.mp.addons import get_cderi_ovl_direct_incore_gpu
 
     # optional arguments
     mol = mp.mol
@@ -209,31 +198,23 @@ def ao2mo(
 
     _, occ_coeff, vir_coeff, _ = mp.split_mo_coeff(mo_coeff, frozen=frozen, mo_occ=mo_occ)
 
-    if cderi_on_gpu is False and build_cderi_on_gpu is False:
-        if isinstance(occ_coeff, cp.ndarray):
-            occ_coeff = occ_coeff.get()
-            vir_coeff = vir_coeff.get()
-        cderi_result = get_cderi_uov_direct_incore_cpu(
-            mol, auxmol, occ_coeff, vir_coeff,
-            fp_type=fp_type, fp_type_decomp=fp_type_decomp, j2c_alg=j2c_alg, verbose=verbose, max_memory=max_memory)
-        mp.j2c_decomp = cderi_result["j2c_decomp"]
-    else:
-        occ_coeff = cp.asarray(occ_coeff)
-        vir_coeff = cp.asarray(vir_coeff)
-        cderi_result = get_cderi_uov_direct_incore_gpu(
-            mol, auxmol, occ_coeff, vir_coeff,
-            fp_type=fp_type, fp_type_decomp=fp_type_decomp, cderi_on_gpu=cderi_on_gpu, j2c_alg=j2c_alg, verbose=verbose)
-        mp.j2c_decomp = cderi_result["j2c_decomp"]
-        mp.intopt = cderi_result["intopt"]
-    if with_cderi_uov:
-        mp.cderi_uov = cderi_result["cderi_uov"]
-    return cderi_result["cderi_uov"]
+    occ_coeff = cp.asarray(occ_coeff)
+    vir_coeff = cp.asarray(vir_coeff)
+    cderi_result = get_cderi_ovl_direct_incore_gpu(
+        mol, auxmol, occ_coeff, vir_coeff,
+        fp_type=fp_type, fp_type_decomp=fp_type_decomp, cderi_on_gpu=cderi_on_gpu, j2c_alg=j2c_alg, verbose=verbose)
+    mp.j2c_decomp = cderi_result["j2c_decomp"]
+    mp.intopt = cderi_result["intopt"]
+
+    if with_cderi_ovl:
+        mp.cderi_ovl = cderi_result["cderi_ovl"]
+    return cderi_result["cderi_ovl"]
 
 
 class DFMP2(GPUMP2):
     _keys = {
-        "with_df", "auxbasis", "mo_energy", "j2c_decomp", "intopt", "t2", "cderi_uov",
-        "with_t2", "cderi_on_gpu", "build_cderi_on_gpu", "with_cderi_uov", "fp_type_decomp", "fp_type", "j2c_alg",
+        "with_df", "auxbasis", "mo_energy", "j2c_decomp", "intopt", "t2", "cderi_ovl",
+        "with_t2", "cderi_on_gpu", "with_cderi_ovl", "fp_type_decomp", "fp_type", "j2c_alg",
     }
 
     def __init__(self, mf, frozen=None, auxbasis=None, mo_coeff=None, mo_occ=None, mo_energy=None):
@@ -259,16 +240,15 @@ class DFMP2(GPUMP2):
         self.with_t2 = CONFIG_WITH_T2
         self.fp_type = CONFIG_FP_TYPE
         self.fp_type_decomp = CONFIG_FP_TYPE_DECOMP
-        self.with_cderi_uov = CONFIG_WITH_CDERI_UOV
+        self.with_cderi_ovl = CONFIG_WITH_CDERI_OVL
         self.cderi_on_gpu = CONFIG_CDERI_ON_GPU
-        self.build_cderi_on_gpu = CONFIG_BUILD_CDERI_ON_GPU
         self.j2c_alg = CONFIG_J2C_ALG
 
         # output intermediates or results, should not be modified by user
         self.j2c_decomp = NotImplemented  # type: dict
         self.intopt = NotImplemented  # type: gpu4pyscf.df.int3c2e.VHFOpt
         self.t2 = NotImplemented  # type: cp.ndarray
-        self.cderi_uov = NotImplemented  # type: cp.ndarray
+        self.cderi_ovl = NotImplemented  # type: cp.ndarray
         self.e_corr = NotImplemented  # type: float
         self.e_corr_os = NotImplemented  # type: float
         self.e_corr_ss = NotImplemented  # type: float
@@ -314,7 +294,7 @@ class DFMP2(GPUMP2):
             eris = self.ao2mo()
 
         _, occ_energy, vir_energy, _ = self.split_mo_energy(mo_energy, frozen=frozen, mo_occ=mo_occ)
-        result = kernel(self, eris, occ_energy, vir_energy, max_memory, verbose)
+        result = get_dfmp2_energy(self, eris, occ_energy, vir_energy, max_memory, verbose)
 
         e_corr_os = result["e_corr_os"]
         e_corr_ss = result["e_corr_ss"]
@@ -354,6 +334,7 @@ if __name__ == "__main__":
         # cderi on gpu
         mf = mf.to_gpu()
         mp = DFMP2(mf).run()
+        print(mp.e_corr)
         assert np.isclose(mp.e_corr, e_ref)
 
         # cderi on cpu
