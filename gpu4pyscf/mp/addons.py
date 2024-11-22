@@ -560,14 +560,13 @@ def get_cderi_ovl_direct_incore_gpu(
     intopt.build(CUTOFF_J3C, diag_block_with_triu=True, aosym=True, group_size=BLKSIZE_AO, group_size_aux=batch_aux)
 
     # === step 0: generate 2c-2e ERI and decomposition ===
+    # We see numerical catastrophe for FP32 in some cases when decomposing j2c by FP32, especially highly polarized or diffusion basis sets.
+    # We found that if j2c is decomposed by FP64, this problem may be alleviated, even we may use (already) decomposed j2c in FP32 for generating cderi by triangular solve.
+    # In most cases j2c and its decomposition is not computational bottleneck, so we prefer to use high-precision FP64 to do this task without introducing much numerical errors.
     j2c = pyscf.df.incore.fill_2c2e(mol, auxmol)
     j2c = intopt.sort_orbitals(j2c, aux_axis=[0, 1])
-    j2c = cp.asarray(j2c, dtype=get_dtype(fp_type_decomp, True), order="C")
+    j2c = cp.asarray(j2c, order="C")
     j2c_decomp = get_j2c_decomp_gpu(mol, j2c, alg=j2c_alg, verbose=verbose)
-    if "j2c_l" in j2c_decomp:
-        j2c_decomp["j2c_l"] = cp.asarray(j2c_decomp["j2c_l"])
-    if "j2c_l_inv" in j2c_decomp:
-        j2c_decomp["j2c_l_inv"] = cp.asarray(j2c_decomp["j2c_l_inv"])
     j2c = None
     t1 = log.timer("generate 2c-2e ERI and decomposition", *t1)
 

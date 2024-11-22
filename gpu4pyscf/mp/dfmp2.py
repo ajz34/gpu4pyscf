@@ -313,7 +313,6 @@ class DFMP2(GPUMP2):
     ao2mo = ao2mo
 
 
-
 if __name__ == "__main__":
     def mf_on_cpu():
         import pyscf.mp
