@@ -1,6 +1,7 @@
 """
 Density fitting MP2 on GPU
 """
+import logging
 
 import pyscf
 import gpu4pyscf
@@ -13,6 +14,8 @@ from gpu4pyscf.lib.cupy_helper import tag_array
 from gpu4pyscf.lib.cupy_helper import get_avail_mem as get_avail_gpu_mem
 from gpu4pyscf.mp.mp2 import MP2 as GPUMP2
 import gpu4pyscf.df.int3c2e
+
+from gpu4pyscf.mp import addons
 
 from gpu4pyscf.mp.addons import (
     CONFIG_USE_SCF_WITH_DF,
@@ -136,9 +139,9 @@ def get_dfmp2_energy(mp, cderi_ovl, occ_energy, vir_energy, with_t2=None, verbos
 
 
 def ao2mo(
-        mp, auxmol=None, mo_coeff=None, mo_occ=None, frozen=None,
+        mp, auxmol=None, mo_coeff=None, mo_occ=None, frozen=None, use_scf_with_df=None,
         cderi_on_gpu=None, with_cderi_ovl=None,
-        fp_type=None, fp_type_decomp=None, j2c_alg=None, verbose=None, max_memory=None):
+        fp_type=None, fp_type_decomp=None, j2c_alg=None, verbose=None):
     """ Wrapper function to generate Cholesky decomposed 3c-2e ERI.
 
     Args:
@@ -156,6 +159,13 @@ def ao2mo(
 
         frozen: int or list(int) or None
             Frozen orbital indication.
+
+        use_scf_with_df: bool or None
+            Returned cderi_ovl value will be evaluated by Cholesky decomposed 3c-2e ERI
+            in atomic orbital basis; shape (naux, nao * (nao + 1) / 2).
+            By using this option, algorithm will be different: j3c and j2c decomposition will not be computed, and thus
+            options like ``auxmol``, ``fp_type_decomp``, ``j2c_alg`` will not affect algorithm and final result.
+            Only useful when ``mp.with_df._cderi`` is not None.
 
         cderi_on_gpu: bool
             Whether generate and store Cholesky decomposed 3c-2e ERI on GPU.
@@ -181,11 +191,10 @@ def ao2mo(
             - "eig": Eigen decomposition
 
         verbose: int or None
-
-        max_memory: float or None
-            Max memory in MB in CPU or GPU, depending on where Cholesky decomposed 3c-2e ERI is stored.
     """
-    from gpu4pyscf.mp.addons import get_cderi_ovl_direct_incore_gpu
+    from gpu4pyscf.mp.addons import get_cderi_ovl_direct_incore_gpu, get_cderi_ovl_incore_gpu
+
+    log = gpu4pyscf.lib.logger.new_logger(mp, verbose)
 
     # optional arguments
     mol = mp.mol
@@ -196,28 +205,77 @@ def ao2mo(
     j2c_alg = mp.j2c_alg if j2c_alg is None else j2c_alg
     verbose = mp.mol.verbose if verbose is None else verbose
 
-    _, occ_coeff, vir_coeff, _ = mp.split_mo_coeff(mo_coeff, frozen=frozen, mo_occ=mo_occ)
+    # determine whether use cderi_ao
+    use_scf_with_df = mp.use_scf_with_df
+    if use_scf_with_df and not (hasattr(mp.with_df, "_cderi") and mp.with_df._cderi is not None):
+        log.warn("use_scf_with_df is on, but mp.with_df._cderi not found.")
+        use_scf_with_df = False
 
+    _, occ_coeff, vir_coeff, _ = mp.split_mo_coeff(mo_coeff, frozen=frozen, mo_occ=mo_occ)
     occ_coeff = cp.asarray(occ_coeff)
     vir_coeff = cp.asarray(vir_coeff)
-    cderi_result = get_cderi_ovl_direct_incore_gpu(
-        mol, auxmol, occ_coeff, vir_coeff,
-        fp_type=fp_type, fp_type_decomp=fp_type_decomp, cderi_on_gpu=cderi_on_gpu, j2c_alg=j2c_alg, verbose=verbose)
-    mp.j2c_decomp = cderi_result["j2c_decomp"]
-    mp.intopt = cderi_result["intopt"]
 
-    if with_cderi_ovl:
-        mp.cderi_ovl = cderi_result["cderi_ovl"]
-    return cderi_result["cderi_ovl"]
+    if not use_scf_with_df:
+        cderi_result = get_cderi_ovl_direct_incore_gpu(
+            mol, auxmol, occ_coeff, vir_coeff,
+            fp_type=fp_type, fp_type_decomp=fp_type_decomp, cderi_on_gpu=cderi_on_gpu, j2c_alg=j2c_alg, verbose=verbose)
+        mp.j2c_decomp = cderi_result["j2c_decomp"]
+        mp.intopt = cderi_result["intopt"]
+
+        if with_cderi_ovl:
+            mp.cderi_ovl = cderi_result["cderi_ovl"]
+        return cderi_result["cderi_ovl"]
+    else:
+        cderi_ovl = get_cderi_ovl_incore_gpu(
+            mol, mp.with_df, occ_coeff, vir_coeff, fp_type=fp_type, cderi_on_gpu=cderi_on_gpu, verbose=verbose)
+        if with_cderi_ovl:
+            mp.cderi_ovl = cderi_ovl
+        return cderi_ovl
+
+
+def kernel(
+        mp, frozen=None, mo_occ=None, mo_energy=None, mo_coeff=None, eris=None, with_t2=None,
+        max_memory=None, verbose=None):
+    log = gpu4pyscf.lib.logger.new_logger(mp, verbose)
+    t0 = log.init_timer()
+
+    with_t2 = mp.with_t2 if with_t2 is None else with_t2
+
+    if mp.verbose >= gpu4pyscf.lib.logger.WARN:
+        mp.check_sanity()
+    mp.dump_flags()
+
+    if mp.e_hf in [None, NotImplemented]:
+        mp.e_hf = mp.get_e_hf(mo_coeff=mo_coeff)
+
+    if eris is None:
+        eris = mp.ao2mo()
+
+    _, occ_energy, vir_energy, _ = mp.split_mo_energy(mo_energy, frozen=frozen, mo_occ=mo_occ)
+    result = get_dfmp2_energy(mp, eris, occ_energy, vir_energy, max_memory, verbose)
+
+    e_corr_os = result["e_corr_os"]
+    e_corr_ss = result["e_corr_ss"]
+    e_corr = tag_array(cp.asarray(e_corr_os + e_corr_ss), e_corr_os=e_corr_os, e_corr_ss=e_corr_ss)
+
+    if with_t2:
+        mp.t2 = result["t2"]
+
+    mp.e_corr = e_corr
+    mp.e_corr_os = e_corr_os
+    mp.e_corr_ss = e_corr_ss
+
+    log.timer("kernel of DFMP2", *t0)
+    return e_corr
 
 
 class DFMP2(GPUMP2):
     _keys = {
         "with_df", "auxbasis", "mo_energy", "j2c_decomp", "intopt", "t2", "cderi_ovl",
-        "with_t2", "cderi_on_gpu", "with_cderi_ovl", "fp_type_decomp", "fp_type", "j2c_alg",
+        "use_scf_with_df", "with_t2", "cderi_on_gpu", "with_cderi_ovl", "fp_type_decomp", "fp_type", "j2c_alg",
     }
 
-    def __init__(self, mf, frozen=None, auxbasis=None, mo_coeff=None, mo_occ=None, mo_energy=None):
+    def __init__(self, mf, frozen=None, auxbasis=None, mo_coeff=None, mo_occ=None, mo_energy=None, use_scf_with_df=None):
         super().__init__(mf, frozen, mo_coeff, mo_occ)
         if not mf.converged:
             raise RuntimeError("SCF must be converged to perform DFMP2. Non-canonical DFMP2 currently not implemented.")
@@ -225,11 +283,14 @@ class DFMP2(GPUMP2):
             self.e_hf = mf.e_tot
         self.mo_energy = mf.mo_energy if mo_energy is None else mo_energy
 
+        # following option must be determined before initialization
+        self.use_scf_with_df = CONFIG_USE_SCF_WITH_DF if use_scf_with_df is None else use_scf_with_df
+
         # auxiliary and cderi configuration
         if auxbasis is not None:
             self.with_df = gpu4pyscf.df.DF(mf.mol, auxbasis=auxbasis)
             self.with_df.auxmol = gpu4pyscf.df.make_auxmol(mf.mol, self.with_df.auxbasis)
-        elif getattr(mf, 'with_df', None) and CONFIG_USE_SCF_WITH_DF:
+        elif getattr(mf, 'with_df', None) and self.use_scf_with_df:
             self.with_df = mf.with_df
         else:
             self.with_df = gpu4pyscf.df.DF(mf.mol)
@@ -257,60 +318,12 @@ class DFMP2(GPUMP2):
         self.with_df.reset(mol)
         return super().reset(mol)
 
-    def mo_splitter(self, frozen=None, mo_occ=None):
-        from gpu4pyscf.mp.addons import mo_splitter_restricted
-        return mo_splitter_restricted(self, frozen=frozen, mo_occ=mo_occ)
-
-    def get_frozen_mask(self, frozen=None, mo_occ=None):
-        from gpu4pyscf.mp.addons import get_frozen_mask_restricted
-        return get_frozen_mask_restricted(self, frozen=frozen, mo_occ=mo_occ)
-
-    def split_mo_coeff(self, mo_coeff=None, frozen=None, mo_occ=None):
-        mo_coeff = self.mo_coeff if mo_coeff is None else mo_coeff
-        masks = self.mo_splitter(frozen=frozen, mo_occ=mo_occ)
-        return [mo_coeff[:, mask] for mask in masks]
-
-    def split_mo_energy(self, mo_energy=None, frozen=None, mo_occ=None):
-        mo_energy = self.mo_energy if mo_energy is None else mo_energy
-        masks = self.mo_splitter(frozen=frozen, mo_occ=mo_occ)
-        return [mo_energy[mask] for mask in masks]
-
-    def kernel(
-            self, frozen=None, mo_occ=None, mo_energy=None, mo_coeff=None, eris=None, with_t2=None,
-            max_memory=None, verbose=None):
-        log = gpu4pyscf.lib.logger.new_logger(self, verbose)
-        t0 = log.init_timer()
-
-        with_t2 = self.with_t2 if with_t2 is None else with_t2
-
-        if self.verbose >= gpu4pyscf.lib.logger.WARN:
-            self.check_sanity()
-        self.dump_flags()
-
-        if self.e_hf in [None, NotImplemented]:
-            self.e_hf = self.get_e_hf(mo_coeff=mo_coeff)
-
-        if eris is None:
-            eris = self.ao2mo()
-
-        _, occ_energy, vir_energy, _ = self.split_mo_energy(mo_energy, frozen=frozen, mo_occ=mo_occ)
-        result = get_dfmp2_energy(self, eris, occ_energy, vir_energy, max_memory, verbose)
-
-        e_corr_os = result["e_corr_os"]
-        e_corr_ss = result["e_corr_ss"]
-        e_corr = tag_array(cp.asarray(e_corr_os + e_corr_ss), e_corr_os=e_corr_os, e_corr_ss=e_corr_ss)
-
-        if with_t2:
-            self.t2 = result["t2"]
-
-        self.e_corr = e_corr
-        self.e_corr_os = e_corr_os
-        self.e_corr_ss = e_corr_ss
-
-        log.timer("kernel of DFMP2", *t0)
-        return e_corr
-
+    mo_splitter = addons.mo_splitter_restricted
+    get_frozen_mask = addons.get_frozen_mask_restricted
+    split_mo_coeff = addons.split_mo_coeff_restricted
+    split_mo_energy = addons.split_mo_energy_restricted
     ao2mo = ao2mo
+    kernel = kernel
 
 
 if __name__ == "__main__":
@@ -322,13 +335,22 @@ if __name__ == "__main__":
         gpu4pyscf.lib.logger.TIMER_LEVEL = 1
 
         e_ref = -0.271121778503736
+        e_ref_frozen = -0.1355734877904028
 
         mol = pyscf.gto.Mole(atom="O; H 1 0.94; H 1 0.94 2 104.5", basis="def2-TZVP").build()
         mf = pyscf.scf.RHF(mol).density_fit(auxbasis="def2-universal-jkfit").run()
+
+        # mp no frozen core
         mp_cpu = pyscf.mp.dfmp2.DFMP2(mf)
         mp_cpu.with_df = pyscf.df.DF(mol, auxbasis="def2-TZVP-ri").build()
         mp_cpu.run()
         assert np.isclose(mp_cpu.e_corr, e_ref)
+
+        # mp with frozen core
+        mp_cpu = pyscf.mp.dfmp2.DFMP2(mf, frozen=[0, 3])
+        mp_cpu.with_df = pyscf.df.DF(mol, auxbasis="def2-TZVP-ri").build()
+        mp_cpu.run()
+        assert np.isclose(mp_cpu.e_corr, e_ref_frozen)
 
         # cderi on gpu
         mf = mf.to_gpu()
@@ -341,6 +363,12 @@ if __name__ == "__main__":
         mp = DFMP2(mf).run(cderi_on_gpu=False)
         print(mp.e_corr)
         assert np.isclose(mp.e_corr, e_ref)
+
+        # cderi on gpu, with frozen
+        mf = mf.to_gpu()
+        mp = DFMP2(mf, frozen=[0, 3]).run()
+        print(mp.e_corr)
+        assert np.isclose(mp.e_corr, e_ref_frozen)
 
     def mf_on_gpu():
 
@@ -362,6 +390,32 @@ if __name__ == "__main__":
         mp = DFMP2(mf).run(cderi_on_gpu=False, fp_type="FP32")
         assert np.isclose(mp.e_corr, e_ref)
 
-    mf_on_cpu()
-    mf_on_gpu()
+    def mf_on_gpu_with_cderi():
+
+        pyscf.lib.logger.TIMER_LEVEL = 1
+        gpu4pyscf.lib.logger.TIMER_LEVEL = 1
+
+        e_ref = -0.2707772810265813
+
+        mol = pyscf.gto.Mole(atom="O; H 1 0.94; H 1 0.94 2 104.5", basis="def2-TZVP").build()
+        mf = gpu4pyscf.scf.RHF(mol).density_fit(auxbasis="def2-universal-jkfit").run()
+
+        # mp no frozen core
+        mp_cpu = pyscf.mp.dfmp2.DFMP2(mf.to_cpu())
+        mp_cpu.with_df = pyscf.df.DF(mol, auxbasis="def2-universal-jkfit").build()
+        mp_cpu.run()
+        assert np.isclose(mp_cpu.e_corr, e_ref)
+
+        mp = DFMP2(mf, auxbasis="def2-universal-jkfit", use_scf_with_df=False).run()
+        assert np.isclose(mp.e_corr, e_ref)
+
+        mp = DFMP2(mf, use_scf_with_df=False).run()
+        assert not np.isclose(mp.e_corr, e_ref)
+
+        mp = DFMP2(mf, use_scf_with_df=True).run()
+        assert np.isclose(mp.e_corr, e_ref)
+
+    # mf_on_cpu()
+    # mf_on_gpu()
+    mf_on_gpu_with_cderi()
 

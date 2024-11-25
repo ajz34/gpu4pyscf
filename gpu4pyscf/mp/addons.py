@@ -164,6 +164,18 @@ def mo_splitter_restricted(mp, frozen=None, mo_occ=None):
     ]
     return masks
 
+
+def split_mo_coeff_restricted(mp, mo_coeff=None, frozen=None, mo_occ=None):
+    mo_coeff = mp.mo_coeff if mo_coeff is None else mo_coeff
+    masks = mo_splitter_restricted(mp, frozen=frozen, mo_occ=mo_occ)
+    return [mo_coeff[:, mask] for mask in masks]
+
+
+def split_mo_energy_restricted(mp, mo_energy=None, frozen=None, mo_occ=None):
+    mo_energy = mp.mo_energy if mo_energy is None else mo_energy
+    masks = mo_splitter_restricted(mp, frozen=frozen, mo_occ=mo_occ)
+    return [mo_energy[mask] for mask in masks]
+
 # endregion
 
 
@@ -329,7 +341,7 @@ def get_int3c2e_by_aux_id(mol, intopt, idx_k, omega=None, out=None):
     return out
 
 
-def _get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_ovl, log):
+def get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_ovl, log):
     """ Inner function for generate and transform 3c-2e ERI to MO basis
 
     Args:
@@ -349,7 +361,7 @@ def _get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_ovl, log):
     dtype = j3c_ovl[0].dtype
 
     for idx_p in range(len(intopt.aux_log_qs)):
-        log.debug(f"processing auxiliary part {idx_p}/{range(len(intopt.aux_log_qs))}")
+        log.debug(f"processing auxiliary part {idx_p}/{len(intopt.aux_log_qs)}")
         if not mol.cart:
             p0, p1 = intopt.sph_aux_loc[idx_p], intopt.sph_aux_loc[idx_p + 1]
         else:
@@ -376,7 +388,7 @@ def _get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, j3c_ovl, log):
     cupy.cuda.get_current_stream().synchronize()
 
 
-def _decompose_j3c(j2c_decomp, j3c, log):
+def decompose_j3c(j2c_decomp, j3c, log):
     """ Inner function for decompose 3c-2e ERI (occ-vir part)
 
     Args:
@@ -441,6 +453,61 @@ def _decompose_j3c(j2c_decomp, j3c, log):
                 j3c[iset].shape = shape
         else:
             raise ValueError(f"Unknown j2c decomposition tag: {j2c_decomp['tag']}")
+    cupy.cuda.get_current_stream().synchronize()
+
+
+def ao2mo_cderi_ovl(with_df, occ_coeff, vir_coeff, cderi_ovl, log):
+    """ Inner function for generate and transform Cholesky decomposed 3c-2e ERI to MO basis
+
+    Args:
+        with_df: gpu4pyscf.df.df.DF
+        occ_coeff: list[cp.ndarray]
+        vir_coeff: list[cp.ndarray]
+        cderi_ovl: list[np.ndarray or cp.ndarray]
+        log: gpu4pyscf.lib.logger.Logger
+    """
+    # we use unpack and contract in python only
+    # so this function is probably not very efficient
+    intopt = with_df.intopt
+    cderi_ao = with_df._cderi
+    naux, nao_tp = cderi_ao.shape
+    nao = int(np.floor(np.sqrt(nao_tp * 2)))
+    if nao * (nao + 1) // 2 != nao_tp:
+        raise ValueError(f"Seems cderi shape {cderi_ao.shape} is not correct.")
+    nset = len(cderi_ovl)
+    cderi_on_gpu = isinstance(cderi_ovl[0], cp.ndarray)
+    dtype = cderi_ovl[0].dtype
+
+    occ_coeff_sorted = [intopt.sort_orbitals(occ_coeff[iset], axis=[0]) for iset in range(nset)]
+    vir_coeff_sorted = [intopt.sort_orbitals(vir_coeff[iset], axis=[0]) for iset in range(nset)]
+
+    cp.get_default_memory_pool().free_all_blocks()
+    log.debug(f"Available GPU memory: {get_avail_gpu_mem() / 1024 ** 3:.6f} GB")
+    fp_avail = 0.7 * get_avail_gpu_mem() / 8
+    batch_aux = int(fp_avail / (3 * nao * nao))
+    log.debug(f"number of auxiliary indices: {batch_aux}")
+    p0 = 0
+    for cderi_batch, _ in with_df.loop(blksize=batch_aux):
+        log.debug(f"processing auxiliary index {p0}/{naux}")
+        nbatch_aux = cderi_batch.shape[0]
+        p1 = p0 + nbatch_aux
+        # Puv, vi -> iPu
+        for iset in range(nset):
+            co = cp.asarray(occ_coeff_sorted[iset])
+            cv = cp.asarray(vir_coeff_sorted[iset])
+            nocc, nvir = co.shape[1], cv.shape[1]
+            # Puv, vi -> iPu
+            cderi_half = co.T @ cderi_batch.reshape(nbatch_aux * nao, nao).T
+            cderi_half.shape = (nocc, nbatch_aux, nao)
+            # iPu, ua -> iaP
+            if cderi_on_gpu:
+                for i in range(nocc):
+                    cderi_ovl[iset][i, :, p0:p1] = cv.T @ cderi_half[i].T
+            else:
+                for i in range(nocc):
+                    cderi_ovl[iset][i, :, p0:p1] = (cv.T @ cderi_half[i].T).astype(dtype).get(blocking=False)
+            co = cv = j3c_half = None
+        j3c = None
     cupy.cuda.get_current_stream().synchronize()
 
 
@@ -572,12 +639,12 @@ def get_cderi_ovl_direct_incore_gpu(
 
     # === step 1: generate 3c-2e ERI ===
     # === step 2: transform 3c-2e ERI to MO basis ===
-    _get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, cderi_ovl, log)
+    get_j3c_ovl_gpu(mol, intopt, occ_coeff, vir_coeff, cderi_ovl, log)
     t1 = log.timer("generate and transform 3c-2e ERI", *t1)
 
     # === step 3: decompose 3c-2e ERI ===
     # transform dtype if necessary
-    _decompose_j3c(j2c_decomp, cderi_ovl, log)
+    decompose_j3c(j2c_decomp, cderi_ovl, log)
     log.timer("decompose 3c-2e ERI", *t1)
 
     # === step 4: return cderi_ovl ===
@@ -597,5 +664,92 @@ def get_cderi_ovl_direct_incore_gpu(
         "cderi_ovl": cderi_ovl,
         "j2c_decomp": j2c_decomp,
     }
+
+
+def get_cderi_ovl_incore_gpu(
+        streamobj, with_df, occ_coeff, vir_coeff,
+        fp_type=CONFIG_FP_TYPE, cderi_on_gpu=True, verbose=None):
+    r""" Generate Cholesky decomposed 3c-2e ERI (occ-vir part) in GPU incore directly.
+
+    Note:
+        Auxiliary basis sequence is not the same to default ``auxmol``; it is defined in returned value ``intopt``.
+        So returned tensor is shuffled (not the same) compared to CPU counterpart.
+
+    Args:
+        streamobj: pyscf.lib.StreamObject
+            Object for logging.
+
+        with_df: gpu4pyscf.df.df.DF
+            Cholesky decomposed 3c-2e ERI in atomic orbital basis. Shape (naux, nao * (nao + 1) / 2).
+
+        occ_coeff: cp.ndarray or list[cp.ndarray]
+            Occupied orbital coefficients. Shape (nset, nao, nocc) or (nao, nocc).
+
+        vir_coeff: cp.ndarray or list[cp.ndarray]
+            Virtual orbital coefficients. Shape (nset, nao, nvir) or (nao, nvir).
+
+        fp_type: str
+            Floating point type for final returned cderi_ovl (step 4).
+
+            - FP64: Double precision
+            - FP32: Single precision
+
+        cderi_on_gpu: bool
+            Whether store cderi on GPU.
+
+        verbose: int or None
+
+    Returns:
+        cderi_ovl: cp.ndarray or list[cp.ndarray]
+            Cholesky decomposed 3c-2e ERI :math:`Y_{P, i a}` in C-contiguous.
+            ``ovl`` refers to (occ, vir, aux (cholesky)).
+    """
+    log = gpu4pyscf.lib.logger.new_logger(streamobj, verbose)
+    t0 = log.init_timer()
+
+    # sanity check and options update
+    # only one set of coefficients
+    unsqueeze_nset = False
+    if occ_coeff.ndim == 2:
+        assert vir_coeff.ndim == 2
+        occ_coeff = [occ_coeff]
+        vir_coeff = [vir_coeff]
+        unsqueeze_nset = True
+    cderi_ao = with_df._cderi
+    naux, nao_tp = cderi_ao.shape
+    nao = int(np.floor(np.sqrt(nao_tp * 2)))
+    if nao * (nao + 1) // 2 != nao_tp:
+        raise ValueError(f"Seems cderi shape {cderi_ao.shape} is not correct.")
+    nset = len(occ_coeff)
+    assert len(vir_coeff) == nset
+    nocc_list = []
+    nvir_list = []
+    for iset in range(nset):
+        assert occ_coeff[iset].ndim == 2
+        assert occ_coeff[iset].shape[0] == nao
+        assert vir_coeff[iset].ndim == 2
+        assert vir_coeff[iset].shape[0] == nao
+        nocc_list.append(occ_coeff[iset].shape[1])
+        nvir_list.append(vir_coeff[iset].shape[1])
+
+    # memory requirement
+    assert fp_type.upper() in ["FP64", "FP32"]
+
+    # this array will be both scratch and output, so naming is a bit tricky
+    # also note that before decomposition, dtype must be FP64
+    if cderi_on_gpu:
+        cderi_ovl = [cp.empty([nocc, nvir, naux], dtype=get_dtype(fp_type, True))
+                     for (nocc, nvir) in zip(nocc_list, nvir_list)]
+    else:
+        cderi_ovl = [np.empty([nocc, nvir, naux], dtype=get_dtype(fp_type, False))
+                     for (nocc, nvir) in zip(nocc_list, nvir_list)]
+
+    ao2mo_cderi_ovl(with_df, occ_coeff, vir_coeff, cderi_ovl, log)
+
+    log.timer("generate cderi_ovl in GPU incore with cderi_ao predefined", *t0)
+    if unsqueeze_nset:
+        cderi_ovl = cderi_ovl[0]
+
+    return cderi_ovl
 
 # endregion
